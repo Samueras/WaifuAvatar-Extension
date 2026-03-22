@@ -68,7 +68,6 @@ Waifu Avatar is a lightweight SillyTavern extension that keeps the default UI in
 
 ## Notes
 
-- This extension does not require Guinevere UI Extension.
 - The extension is designed to preserve the base SillyTavern layout outside its VN image behavior.
 - If images seem stale after updates, do a hard refresh (`Ctrl+F5`).
 
