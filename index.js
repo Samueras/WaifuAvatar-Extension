@@ -1,11 +1,12 @@
 (function () {
-    const EXT_VERSION = '1.0.7';
+    const EXT_VERSION = '1.0.9';
     const FALLBACK_WRAPPER_ID = 'wacg-vn-fallback-wrapper';
     const HOLDER_ID = 'wacg-vn-holder';
     const IMAGE_ID = 'wacg-vn-image';
     const LEFT_ZONE_ID = 'wacg-vn-zone-left';
     const RIGHT_ZONE_ID = 'wacg-vn-zone-right';
     const BUTTON_ID = 'wacg-download-gallery-btn';
+    const EMBEDDED_BUTTON_ID = 'wacg-import-embedded-btn';
     const POLL_INTERVAL_MS = 1000;
     const CAROUSEL_STATE_KEY = 'waifu_avatar_carousel_state_v1';
 
@@ -476,7 +477,69 @@
         }
     }
 
-    async function uploadImageToStGallery(imageUrl, folderName) {
+    function extractEmbeddedImageUrls(text) {
+        const urls = [];
+        const source = String(text || '');
+        if (!source) {
+            return urls;
+        }
+
+        // Markdown image syntax: ![alt](url "optional title")
+        const markdownRegex = /!\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+        let markdownMatch;
+        while ((markdownMatch = markdownRegex.exec(source)) !== null) {
+            if (markdownMatch[1]) {
+                urls.push(markdownMatch[1]);
+            }
+        }
+
+        // HTML image syntax: <img src="...">
+        const htmlRegex = /<img[^>]+src=["']([^"']+)["']/gi;
+        let htmlMatch;
+        while ((htmlMatch = htmlRegex.exec(source)) !== null) {
+            if (htmlMatch[1]) {
+                urls.push(htmlMatch[1]);
+            }
+        }
+
+        return urls;
+    }
+
+    function normalizeImageUrl(url) {
+        const raw = String(url || '').trim();
+        if (!raw) {
+            return '';
+        }
+
+        if (raw.startsWith('data:image/')) {
+            return raw;
+        }
+
+        try {
+            return new URL(raw, window.location.origin).toString();
+        } catch {
+            return '';
+        }
+    }
+
+    function getEmbeddedImageUrlsForCurrentCharacter() {
+        const character = getCurrentCharacterData();
+        if (!character) {
+            return [];
+        }
+
+        const texts = [
+            character.description || '',
+            character.first_mes || '',
+            ...(Array.isArray(character?.data?.alternate_greetings) ? character.data.alternate_greetings : []),
+        ];
+
+        const urls = texts.flatMap((text) => extractEmbeddedImageUrls(text));
+        const normalized = urls.map(normalizeImageUrl).filter(Boolean);
+        return [...new Set(normalized)];
+    }
+
+    async function uploadImageToStGallery(imageUrl, folderName, options = {}) {
         if (!stSaveBase64AsFile) {
             try {
                 const utilsModule = await import('/scripts/utils.js');
@@ -489,22 +552,36 @@
         if (typeof stSaveBase64AsFile !== 'function') {
             throw new Error('ST upload helper is unavailable');
         }
+        const isDataUrl = String(imageUrl).startsWith('data:image/');
+        let base64DataUrl = '';
+        let base64Chunk = '';
+        let rawFileName = options.filename || '';
 
-        const imageResponse = await fetch(imageUrl, { headers: getChubHeaders() });
-        if (!imageResponse.ok) {
-            throw new Error(`Failed to fetch gallery image (${imageResponse.status})`);
+        if (isDataUrl) {
+            // For embedded data URLs in cards.
+            const base64Part = String(imageUrl).split(',')[1] || '';
+            base64Chunk = String(base64Part).replace(/\s+/g, '');
+            if (!base64Chunk) {
+                throw new Error('Embedded data URL contains no image payload');
+            }
+            base64DataUrl = `data:image/png;base64,${base64Chunk}`;
+            rawFileName = rawFileName || `embedded-${Date.now()}.png`;
+        } else {
+            const responseHeaders = options.headers || {};
+            const imageResponse = await fetch(imageUrl, { headers: responseHeaders });
+            if (!imageResponse.ok) {
+                throw new Error(`Failed to fetch gallery image (${imageResponse.status})`);
+            }
+
+            const imageBlob = await imageResponse.blob();
+            const pngDataUrl = await blobToPngDataUrl(imageBlob);
+            base64Chunk = String(pngDataUrl.split(',')[1] || '').replace(/\s+/g, '');
+            if (!base64Chunk) {
+                throw new Error('Failed to encode image as base64');
+            }
+            base64DataUrl = `data:image/png;base64,${base64Chunk}`;
+            rawFileName = rawFileName || imageUrl.split('/').pop()?.split('?')[0] || `image-${Date.now()}.png`;
         }
-
-        const imageBlob = await imageResponse.blob();
-        const pngDataUrl = await blobToPngDataUrl(imageBlob);
-        const base64Chunk = String(pngDataUrl.split(',')[1] || '').replace(/\s+/g, '');
-        if (!base64Chunk) {
-            throw new Error('Failed to encode image as base64');
-        }
-        // Rebuild the data URL in the exact form the ST endpoint parser expects.
-        const base64DataUrl = `data:image/png;base64,${base64Chunk}`;
-
-        const rawFileName = imageUrl.split('/').pop()?.split('?')[0] || `chub-${Date.now()}.png`;
 
         const payload = {
             image: base64DataUrl,
@@ -522,7 +599,7 @@
                 dataUrlHeader: base64DataUrl.split(',')[0],
                 hasComma: base64DataUrl.includes(','),
                 headerPreview: base64DataUrl.slice(0, 64),
-                base64Length: base64Chunk.length,
+                base64Length: (base64DataUrl.split(',')[1] || '').length,
                 serverParseFormatPreview: base64DataUrl.split(',')[0].split(';')[0].split('/')[1],
                 version: EXT_VERSION,
             });
@@ -599,6 +676,63 @@
         }
     }
 
+    async function importEmbeddedImagesFromCurrentCharacter() {
+        if (isDownloading) {
+            return;
+        }
+
+        const galleryFolder = getGalleryFolderForCurrentCharacter();
+        if (!galleryFolder) {
+            toastr.warning('No character selected to import gallery into.');
+            return;
+        }
+
+        const embeddedUrls = getEmbeddedImageUrlsForCurrentCharacter();
+        if (!embeddedUrls.length) {
+            toastr.info('No embedded images found in description or greetings.');
+            return;
+        }
+
+        const button = document.getElementById(EMBEDDED_BUTTON_ID);
+        isDownloading = true;
+        if (button instanceof HTMLElement) {
+            button.classList.add('disabled');
+            button.setAttribute('title', 'Importing embedded images...');
+        }
+
+        try {
+            toastr.info(`Importing ${embeddedUrls.length} embedded image(s) into SillyTavern gallery...`);
+            let importedCount = 0;
+            for (let i = 0; i < embeddedUrls.length; i++) {
+                try {
+                    await uploadImageToStGallery(
+                        embeddedUrls[i],
+                        galleryFolder,
+                        { filename: `embedded-${String(i + 1).padStart(3, '0')}.png` },
+                    );
+                    importedCount++;
+                } catch (error) {
+                    console.warn('[WaifuAvatar] Skipped embedded image import:', error);
+                }
+            }
+
+            if (importedCount === 0) {
+                toastr.warning('No embedded images could be imported.');
+            } else {
+                toastr.success(`Imported ${importedCount} embedded image(s) into "${galleryFolder}".`);
+            }
+        } catch (error) {
+            console.error('[WaifuAvatar] Embedded image import failed:', error);
+            toastr.error(`Failed to import embedded images: ${error.message || error}`);
+        } finally {
+            isDownloading = false;
+            if (button instanceof HTMLElement) {
+                button.classList.remove('disabled');
+                button.setAttribute('title', 'Import embedded images from description and greetings');
+            }
+        }
+    }
+
     function ensureGalleryButton() {
         const titleRow = document.querySelector('#description_div .flex-container.alignitemscenter');
         if (!(titleRow instanceof HTMLElement)) {
@@ -620,8 +754,24 @@
             button.dataset.bound = 'true';
         }
 
+        let embeddedButton = document.getElementById(EMBEDDED_BUTTON_ID);
+        if (!(embeddedButton instanceof HTMLDivElement)) {
+            embeddedButton = document.createElement('div');
+            embeddedButton.id = EMBEDDED_BUTTON_ID;
+            embeddedButton.className = 'menu_button menu_button_icon';
+            embeddedButton.innerHTML = '<i class="fa-solid fa-file-image"></i><span>Import Embedded Images</span>';
+            embeddedButton.setAttribute('title', 'Import embedded images from description and greetings');
+            titleRow.appendChild(embeddedButton);
+        }
+
+        if (embeddedButton.dataset.bound !== 'true') {
+            embeddedButton.addEventListener('click', importEmbeddedImagesFromCurrentCharacter);
+            embeddedButton.dataset.bound = 'true';
+        }
+
         const chubPath = getCurrentCharacterChubPath();
         button.style.display = chubPath ? '' : 'none';
+        embeddedButton.style.display = getCurrentCharacterData() ? '' : 'none';
     }
 
     const syncAllDebounced = debounce(() => {

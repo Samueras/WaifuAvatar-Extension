@@ -2,7 +2,7 @@
   "display_name": "Waifu Avatar",
   "description": "Replaces VN sprites with a character avatar view and adds Chub gallery import + left/right gallery carousel controls.",
   "author": "Samueras",
-  "version": "1.0.7",
+  "version": "1.0.9",
   "loading_order": 103,
   "js": "index.js",
   "css": "style.css",
