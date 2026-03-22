@@ -85,3 +85,11 @@ Waifu Avatar is a lightweight SillyTavern extension that keeps the default UI in
 ## License
 
 This project is licensed under GNU GPL v3.0. See the [LICENSE](LICENSE) file.
+
+---
+
+## ❤️ Support the Project
+
+If this extension helps you, please consider supporting my work:
+
+- [☕ Buy me a coffee on Ko-fi](https://ko-fi.com/samueras)
