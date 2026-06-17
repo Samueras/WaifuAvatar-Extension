@@ -1,5 +1,5 @@
 (function () {
-    const EXT_VERSION = '1.0.9';
+    const EXT_VERSION = '1.0.11';
     const FALLBACK_WRAPPER_ID = 'wacg-vn-fallback-wrapper';
     const HOLDER_ID = 'wacg-vn-holder';
     const IMAGE_ID = 'wacg-vn-image';
@@ -539,6 +539,65 @@
         return [...new Set(normalized)];
     }
 
+    async function getCharacterLorebookImageUrls() {
+        const character = getCurrentCharacterData();
+        if (!character) {
+            return [];
+        }
+
+        const worldName = character?.data?.extensions?.world;
+        if (typeof worldName !== 'string' || !worldName.trim()) {
+            return [];
+        }
+
+        const context = getContextSafe();
+        if (!context || typeof context.getRequestHeaders !== 'function') {
+            return [];
+        }
+
+        let data;
+        try {
+            const response = await fetch('/api/worldinfo/get', {
+                method: 'POST',
+                headers: context.getRequestHeaders(),
+                body: JSON.stringify({ name: worldName }),
+                cache: 'no-cache',
+            });
+            if (!response.ok) {
+                console.warn('[WaifuAvatar] Lorebook fetch failed:', worldName, response.status);
+                return [];
+            }
+            data = await response.json();
+        } catch (error) {
+            console.warn('[WaifuAvatar] Lorebook fetch error:', error);
+            return [];
+        }
+
+        const entries = data?.entries;
+        if (!entries || typeof entries !== 'object') {
+            return [];
+        }
+
+        const urls = [];
+        for (const entry of Object.values(entries)) {
+            const fields = [entry?.content, entry?.comment, entry?.key];
+            for (const field of fields) {
+                if (typeof field === 'string') {
+                    urls.push(...extractEmbeddedImageUrls(field));
+                } else if (Array.isArray(field)) {
+                    for (const item of field) {
+                        if (typeof item === 'string') {
+                            urls.push(...extractEmbeddedImageUrls(item));
+                        }
+                    }
+                }
+            }
+        }
+
+        const normalized = urls.map(normalizeImageUrl).filter(Boolean);
+        return [...new Set(normalized)];
+    }
+
     async function uploadImageToStGallery(imageUrl, folderName, options = {}) {
         if (!stSaveBase64AsFile) {
             try {
@@ -568,7 +627,24 @@
             rawFileName = rawFileName || `embedded-${Date.now()}.png`;
         } else {
             const responseHeaders = options.headers || {};
-            const imageResponse = await fetch(imageUrl, { headers: responseHeaders });
+            let imageResponse;
+            let usedProxy = false;
+            try {
+                imageResponse = await fetch(imageUrl, { headers: responseHeaders });
+            } catch (directError) {
+                // Likely CORS-blocked. Retry through SillyTavern's CORS proxy if available.
+                try {
+                    const proxyUrl = `/proxy/${imageUrl.replace(/^https?:\/\//, 'https://')}`;
+                    imageResponse = await fetch(proxyUrl);
+                    usedProxy = true;
+                } catch (proxyError) {
+                    throw new Error(
+                        `Failed to fetch image directly (${directError?.message || directError}) ` +
+                        `and ST CORS proxy is unavailable or disabled. ` +
+                        `Enable it with --corsProxy or set "enableCorsProxy: true" in config.yaml.`,
+                    );
+                }
+            }
             if (!imageResponse.ok) {
                 throw new Error(`Failed to fetch gallery image (${imageResponse.status})`);
             }
@@ -581,6 +657,9 @@
             }
             base64DataUrl = `data:image/png;base64,${base64Chunk}`;
             rawFileName = rawFileName || imageUrl.split('/').pop()?.split('?')[0] || `image-${Date.now()}.png`;
+            if (usedProxy) {
+                console.info('[WaifuAvatar] Image fetched via ST CORS proxy:', imageUrl);
+            }
         }
 
         const payload = {
@@ -687,12 +766,6 @@
             return;
         }
 
-        const embeddedUrls = getEmbeddedImageUrlsForCurrentCharacter();
-        if (!embeddedUrls.length) {
-            toastr.info('No embedded images found in description or greetings.');
-            return;
-        }
-
         const button = document.getElementById(EMBEDDED_BUTTON_ID);
         isDownloading = true;
         if (button instanceof HTMLElement) {
@@ -701,12 +774,23 @@
         }
 
         try {
-            toastr.info(`Importing ${embeddedUrls.length} embedded image(s) into SillyTavern gallery...`);
+            toastr.info('Scanning description, greetings, and lorebook...');
+            const embeddedUrls = getEmbeddedImageUrlsForCurrentCharacter();
+            const lorebookUrls = await getCharacterLorebookImageUrls();
+
+            const allUrls = [...new Set([...embeddedUrls, ...lorebookUrls])];
+
+            if (!allUrls.length) {
+                toastr.info('No embedded images found in description, greetings, or lorebook.');
+                return;
+            }
+
+            toastr.info(`Importing ${allUrls.length} embedded image(s) into SillyTavern gallery...`);
             let importedCount = 0;
-            for (let i = 0; i < embeddedUrls.length; i++) {
+            for (let i = 0; i < allUrls.length; i++) {
                 try {
                     await uploadImageToStGallery(
-                        embeddedUrls[i],
+                        allUrls[i],
                         galleryFolder,
                         { filename: `embedded-${String(i + 1).padStart(3, '0')}.png` },
                     );
