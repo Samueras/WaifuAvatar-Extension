@@ -1,8 +1,8 @@
 {
   "display_name": "Waifu Avatar",
-  "description": "Replaces VN sprites with a character avatar view and adds Chub gallery import + left/right gallery carousel controls.",
+  "description": "VN avatar carousel with Chub and BotBooru gallery imports, plus images and linked albums from creator notes, descriptions, greetings, and lorebooks.",
   "author": "Samueras",
-  "version": "1.0.11",
+  "version": "1.1.5",
   "loading_order": 103,
   "js": "index.js",
   "css": "style.css",

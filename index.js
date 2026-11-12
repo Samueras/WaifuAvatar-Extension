@@ -1,5 +1,5 @@
 (function () {
-    const EXT_VERSION = '1.0.11';
+    const EXT_VERSION = '1.1.5';
     const FALLBACK_WRAPPER_ID = 'wacg-vn-fallback-wrapper';
     const HOLDER_ID = 'wacg-vn-holder';
     const IMAGE_ID = 'wacg-vn-image';
@@ -7,6 +7,8 @@
     const RIGHT_ZONE_ID = 'wacg-vn-zone-right';
     const BUTTON_ID = 'wacg-download-gallery-btn';
     const EMBEDDED_BUTTON_ID = 'wacg-import-embedded-btn';
+    const getGalleryTools = () => import('./gallery-import.js');
+    let botbooruToken = '';
     const POLL_INTERVAL_MS = 1000;
     const CAROUSEL_STATE_KEY = 'waifu_avatar_carousel_state_v1';
 
@@ -18,6 +20,7 @@
     let avatarIntervalId = null;
     let isDownloading = false;
     let stSaveBase64AsFile = null;
+    let stSha256 = null;
     const carouselState = {
         avatarFile: '',
         sources: [],
@@ -372,35 +375,6 @@
         return gallerySettings?.folders?.[avatarKey] ?? character.name;
     }
 
-    function parseChubPathFromUrl(url) {
-        if (typeof url !== 'string' || !url.trim()) {
-            return null;
-        }
-
-        const clean = url.trim();
-        const directMatch = clean.match(/chub\.ai\/characters\/([^?#]+)/i);
-        if (directMatch?.[1]) {
-            return decodeURIComponent(directMatch[1]).replace(/^\/+/, '');
-        }
-
-        return null;
-    }
-
-    function getCurrentCharacterChubPath() {
-        const character = getCurrentCharacterData();
-        if (!character) {
-            return null;
-        }
-
-        const fullPath = character?.data?.extensions?.chub?.full_path;
-        if (typeof fullPath === 'string' && fullPath.trim()) {
-            return fullPath.trim();
-        }
-
-        const sourceUrl = character?.data?.extensions?.source_url;
-        return parseChubPathFromUrl(sourceUrl);
-    }
-
     function getChubHeaders() {
         const headers = { Accept: 'application/json' };
 
@@ -416,8 +390,10 @@
     }
 
     async function fetchChubCharacterNode(chubPath) {
-        const url = `https://api.chub.ai/api/characters/${encodeURI(chubPath)}?full=false`;
-        const response = await fetch(url, { headers: getChubHeaders() });
+        const encodedPath = chubPath.split('/').map(part => encodeURIComponent(decodeURIComponent(part))).join('/');
+        const url = `https://api.chub.ai/api/characters/${encodedPath}?full=true`;
+        const { fetchRemote } = await getGalleryTools();
+        const response = await fetchRemote(url, getChubHeaders());
         if (!response.ok) {
             throw new Error(`Failed to fetch character info (${response.status})`);
         }
@@ -436,7 +412,8 @@
 
         for (let page = 1; page <= 20; page++) {
             const url = `https://api.chub.ai/api/gallery/project/${encodeURIComponent(cardId)}?nsfw=true&page=${page}&limit=${limit}`;
-            const response = await fetch(url, { headers: getChubHeaders() });
+            const { fetchRemote } = await getGalleryTools();
+            const response = await fetchRemote(url, getChubHeaders());
             if (!response.ok) {
                 throw new Error(`Failed to fetch gallery page ${page} (${response.status})`);
             }
@@ -516,31 +493,29 @@
         }
 
         try {
-            return new URL(raw, window.location.origin).toString();
+            const parsed = new URL(raw, window.location.origin);
+            return /^https?:$/.test(parsed.protocol) ? parsed.toString() : '';
         } catch {
             return '';
         }
     }
 
-    function getEmbeddedImageUrlsForCurrentCharacter() {
-        const character = getCurrentCharacterData();
+    async function getEmbeddedImageUrlsForCurrentCharacter(character = getCurrentCharacterData()) {
         if (!character) {
             return [];
         }
 
-        const texts = [
-            character.description || '',
-            character.first_mes || '',
-            ...(Array.isArray(character?.data?.alternate_greetings) ? character.data.alternate_greetings : []),
-        ];
-
-        const urls = texts.flatMap((text) => extractEmbeddedImageUrls(text));
+        const { characterTexts, extractLinks } = await getGalleryTools();
+        const texts = characterTexts(character);
+        const urls = texts.flatMap(text => [
+            ...extractEmbeddedImageUrls(text).filter(url => url.startsWith('data:image/')), ...extractLinks(text),
+        ]);
         const normalized = urls.map(normalizeImageUrl).filter(Boolean);
         return [...new Set(normalized)];
     }
 
-    async function getCharacterLorebookImageUrls() {
-        const character = getCurrentCharacterData();
+    async function getCharacterLorebookImageUrls(character = getCurrentCharacterData()) {
+        const { extractLinks } = await getGalleryTools();
         if (!character) {
             return [];
         }
@@ -583,11 +558,11 @@
             const fields = [entry?.content, entry?.comment, entry?.key];
             for (const field of fields) {
                 if (typeof field === 'string') {
-                    urls.push(...extractEmbeddedImageUrls(field));
+                    urls.push(...extractEmbeddedImageUrls(field).filter(url => url.startsWith('data:image/')), ...extractLinks(field));
                 } else if (Array.isArray(field)) {
                     for (const item of field) {
                         if (typeof item === 'string') {
-                            urls.push(...extractEmbeddedImageUrls(item));
+                            urls.push(...extractEmbeddedImageUrls(item).filter(url => url.startsWith('data:image/')), ...extractLinks(item));
                         }
                     }
                 }
@@ -598,161 +573,240 @@
         return [...new Set(normalized)];
     }
 
-    async function uploadImageToStGallery(imageUrl, folderName, options = {}) {
-        if (!stSaveBase64AsFile) {
+    async function normalizeGalleryImage(blob) {
+        // Canvas strips file metadata and normalizes formats before comparing.
+        const dataUrl = await blobToPngDataUrl(blob);
+        const base64 = String(dataUrl.split(',')[1] || '').replace(/\s+/g, '');
+        if (!base64) throw new Error('Failed to encode image as base64');
+        if (!stSha256) {
+            // ST bundles SHA-256, including for HTTP/LAN pages without crypto.subtle.
+            const library = await import('/lib.js');
+            stSha256 = library.sha256;
+        }
+        return { base64, fingerprint: stSha256(base64) };
+    }
+
+    async function getGalleryImageFingerprints(folderName, button) {
+        const context = getContextSafe();
+        if (typeof context?.getRequestHeaders !== 'function') throw new Error('Cannot check the existing gallery: SillyTavern context is unavailable.');
+        const response = await fetch('/api/images/list', {
+            method: 'POST',
+            headers: context.getRequestHeaders(),
+            body: JSON.stringify({ folder: folderName }),
+            cache: 'no-store',
+        });
+        if (!response.ok) throw new Error('Cannot check the existing gallery (' + response.status + '). Import stopped to avoid duplicates.');
+        const files = await response.json();
+        if (!Array.isArray(files)) throw new Error('Cannot check the existing gallery: invalid file list.');
+        const fingerprints = new Set();
+        let unreadable = 0;
+        if (files.length) toastr.info('Checking ' + files.length + ' existing gallery image(s) for duplicates...');
+        for (let i = 0; i < files.length; i++) {
+            if (button) button.title = 'Checking existing images ' + (i + 1) + '/' + files.length + '...';
+            const url = '/user/images/' + encodeURIComponent(folderName) + '/' + encodeURIComponent(String(files[i]));
             try {
-                const utilsModule = await import('/scripts/utils.js');
-                stSaveBase64AsFile = utilsModule.saveBase64AsFile;
+                const image = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(25000) });
+                if (!image.ok) throw new Error('HTTP ' + image.status);
+                const normalized = await normalizeGalleryImage(await image.blob());
+                fingerprints.add(normalized.fingerprint);
             } catch (error) {
-                throw new Error(`Failed to load ST upload helper: ${error?.message || error}`);
+                unreadable++;
+                console.warn('[WaifuAvatar] Could not compare existing image:', files[i], error);
             }
         }
+        if (unreadable) toastr.warning(unreadable + ' existing image(s) could not be checked for duplicates.');
+        return fingerprints;
+    }
 
-        if (typeof stSaveBase64AsFile !== 'function') {
-            throw new Error('ST upload helper is unavailable');
-        }
-        const isDataUrl = String(imageUrl).startsWith('data:image/');
-        let base64DataUrl = '';
-        let base64Chunk = '';
-        let rawFileName = options.filename || '';
-
-        if (isDataUrl) {
-            // For embedded data URLs in cards.
-            const base64Part = String(imageUrl).split(',')[1] || '';
-            base64Chunk = String(base64Part).replace(/\s+/g, '');
-            if (!base64Chunk) {
-                throw new Error('Embedded data URL contains no image payload');
-            }
-            base64DataUrl = `data:image/png;base64,${base64Chunk}`;
-            rawFileName = rawFileName || `embedded-${Date.now()}.png`;
+    async function uploadImageToStGallery(imageUrl, folderName, options = {}) {
+        let response;
+        if (String(imageUrl).startsWith('data:image/')) {
+            response = await fetch(imageUrl);
         } else {
-            const responseHeaders = options.headers || {};
-            let imageResponse;
-            let usedProxy = false;
+            const { fetchRemote } = await getGalleryTools();
+            response = await fetchRemote(imageUrl, options.headers || {});
+        }
+        if (!response.ok) throw new Error('Failed to fetch gallery image (' + response.status + ')');
+        const { base64, fingerprint } = await normalizeGalleryImage(await response.blob());
+        if (options.fingerprints?.has(fingerprint)) return false;
+        if (!stSaveBase64AsFile) {
+            const utilsModule = await import('/scripts/utils.js');
+            stSaveBase64AsFile = utilsModule.saveBase64AsFile;
+        }
+        if (typeof stSaveBase64AsFile !== 'function') throw new Error('ST upload helper is unavailable');
+        // Content-based filenames also avoid overwriting different images when the
+        // ordering of a remote gallery changes between imports.
+        await stSaveBase64AsFile(base64, folderName, 'waifu-' + fingerprint, 'png');
+        // A failed save must remain eligible for another attempt later in the run.
+        options.fingerprints?.add(fingerprint);
+        return true;
+    }
+
+    async function importImageUrls(urls, folderName, button) {
+        const fingerprints = await getGalleryImageFingerprints(folderName, button);
+        let imported = 0;
+        let duplicates = 0;
+        let failed = 0;
+        const uniqueUrls = [...new Set(urls)];
+        for (let i = 0; i < uniqueUrls.length; i++) {
+            if (button) button.title = 'Importing ' + (i + 1) + '/' + uniqueUrls.length + '...';
             try {
-                imageResponse = await fetch(imageUrl, { headers: responseHeaders });
-            } catch (directError) {
-                // Likely CORS-blocked. Retry through SillyTavern's CORS proxy if available.
-                try {
-                    const proxyUrl = `/proxy/${imageUrl.replace(/^https?:\/\//, 'https://')}`;
-                    imageResponse = await fetch(proxyUrl);
-                    usedProxy = true;
-                } catch (proxyError) {
-                    throw new Error(
-                        `Failed to fetch image directly (${directError?.message || directError}) ` +
-                        `and ST CORS proxy is unavailable or disabled. ` +
-                        `Enable it with --corsProxy or set "enableCorsProxy: true" in config.yaml.`,
-                    );
+                const saved = await uploadImageToStGallery(uniqueUrls[i], folderName, { fingerprints });
+                if (saved) imported++;
+                else duplicates++;
+            } catch (error) {
+                failed++;
+                console.warn('[WaifuAvatar] Gallery image skipped:', error);
+            }
+        }
+        const message = 'Imported ' + imported + ' new image(s); skipped ' + duplicates + ' duplicate(s).';
+        if (imported) toastr.success(message);
+        else if (duplicates) toastr.info(message);
+        else toastr.warning('No images could be imported.');
+        if (failed) toastr.warning(failed + ' image(s) could not be downloaded. Check the console for host errors.');
+        return { imported, duplicates, failed };
+    }
+
+    async function requestCardSource(character) {
+        const { findCardSource, parseCardSource } = await getGalleryTools();
+        const key = 'waifu_avatar_gallery_source_' + character.avatar;
+        let saved = '';
+        try { saved = localStorage.getItem(key) || localStorage.getItem('waifu_avatar_botbooru_' + character.avatar) || ''; } catch { /* storage unavailable */ }
+        const detected = findCardSource(character, saved);
+        if (detected) return detected;
+        return new Promise(resolve => {
+            const dialog = document.createElement('dialog');
+            dialog.className = 'wacg-auth-dialog';
+            dialog.innerHTML = '<form method="dialog"><h3>Import Gallery</h3>' +
+                '<p>This card has no Chub or BotBooru source link. Paste its card URL to import its gallery and linked albums.</p>' +
+                '<label>Card URL <input class="text_pole" type="url" placeholder="https://chub.ai/characters/creator/card or https://botbooru.com/character/12345" required></label>' +
+                '<p class="wacg-source-error" role="alert"></p>' +
+                '<button class="menu_button" value="import">Import</button>' +
+                '<button class="menu_button" value="cancel" formnovalidate>Cancel</button></form>';
+            dialog.querySelector('form').addEventListener('submit', event => {
+                if (event.submitter?.value === 'cancel') return;
+                if (!parseCardSource(dialog.querySelector('input').value)) {
+                    event.preventDefault();
+                    dialog.querySelector('.wacg-source-error').textContent = 'Enter a Chub or BotBooru character URL.';
                 }
-            }
-            if (!imageResponse.ok) {
-                throw new Error(`Failed to fetch gallery image (${imageResponse.status})`);
-            }
-
-            const imageBlob = await imageResponse.blob();
-            const pngDataUrl = await blobToPngDataUrl(imageBlob);
-            base64Chunk = String(pngDataUrl.split(',')[1] || '').replace(/\s+/g, '');
-            if (!base64Chunk) {
-                throw new Error('Failed to encode image as base64');
-            }
-            base64DataUrl = `data:image/png;base64,${base64Chunk}`;
-            rawFileName = rawFileName || imageUrl.split('/').pop()?.split('?')[0] || `image-${Date.now()}.png`;
-            if (usedProxy) {
-                console.info('[WaifuAvatar] Image fetched via ST CORS proxy:', imageUrl);
-            }
-        }
-
-        const payload = {
-            image: base64DataUrl,
-            ch_name: folderName,
-            filename: rawFileName.replace(/\./g, '_'),
-        };
-        try {
-            // Use ST's own helper to avoid request formatting/token mismatches.
-            await stSaveBase64AsFile(base64Chunk, folderName, payload.filename, 'png');
-        } catch (error) {
-            console.warn('[WaifuAvatar] Upload failed', {
-                details: String(error?.message || error),
-                folderName,
-                imageUrl,
-                dataUrlHeader: base64DataUrl.split(',')[0],
-                hasComma: base64DataUrl.includes(','),
-                headerPreview: base64DataUrl.slice(0, 64),
-                base64Length: (base64DataUrl.split(',')[1] || '').length,
-                serverParseFormatPreview: base64DataUrl.split(',')[0].split(';')[0].split('/')[1],
-                version: EXT_VERSION,
             });
-            throw error;
-        }
+            dialog.addEventListener('close', () => {
+                const source = dialog.returnValue === 'import' ? parseCardSource(dialog.querySelector('input').value) : null;
+                dialog.remove();
+                resolve(source);
+            }, { once: true });
+            document.body.appendChild(dialog);
+            dialog.showModal();
+        });
     }
 
     async function downloadGalleryFromCurrentCharacter() {
-        if (isDownloading) {
-            return;
-        }
-
-        const chubPath = getCurrentCharacterChubPath();
-        if (!chubPath) {
-            toastr.warning('No Chub source found on this character.');
-            return;
-        }
-        const galleryFolder = getGalleryFolderForCurrentCharacter();
-        if (!galleryFolder) {
-            toastr.warning('No character selected to import gallery into.');
-            return;
-        }
-
+        if (isDownloading) return;
+        const character = getCurrentCharacterData();
+        const folder = getGalleryFolderForCurrentCharacter();
+        if (!character || !folder) { toastr.warning('Select a character to import into.'); return; }
+        const avatarFile = character.avatar;
         const button = document.getElementById(BUTTON_ID);
         isDownloading = true;
-        if (button instanceof HTMLElement) {
-            button.classList.add('disabled');
-            button.setAttribute('title', 'Importing gallery...');
-        }
-
+        button?.classList.add('disabled');
         try {
-            toastr.info('Fetching Chub gallery info...');
-            const node = await fetchChubCharacterNode(chubPath);
-            const cardId = node?.id;
-            if (!cardId) {
-                throw new Error('Chub card id was not found');
-            }
-
-            const galleryNodes = await fetchAllGalleryNodes(cardId);
-            const imageUrls = galleryNodes
-                .map((nodeItem) => nodeItem?.primary_image_path)
-                .filter((url) => typeof url === 'string' && url.length > 0);
-
-            if (!imageUrls.length) {
-                toastr.info('No gallery images found for this character.');
-                return;
-            }
-
-            toastr.info(`Importing ${imageUrls.length} image(s) into SillyTavern gallery...`);
-            let importedCount = 0;
-            for (let i = 0; i < imageUrls.length; i++) {
-                try {
-                    await uploadImageToStGallery(imageUrls[i], galleryFolder);
-                    importedCount++;
-                } catch (error) {
-                    console.warn('[WaifuAvatar] Skipped gallery image import:', error);
-                }
-            }
-
-            if (importedCount === 0) {
-                toastr.warning('No gallery images could be imported.');
-            } else {
-                toastr.success(`Imported ${importedCount} image(s) into gallery folder "${galleryFolder}".`);
-            }
+            const source = await requestCardSource(character);
+            if (!source) return;
+            const provider = source.provider === 'chub' ? 'Chub' : 'BotBooru';
+            toastr.info('Fetching ' + provider + ' gallery...');
+            const remote = source.provider === 'chub'
+                ? await collectChubGallery(source) : await collectBotbooruGallery(source);
+            if (!remote) return;
+            try { localStorage.setItem('waifu_avatar_gallery_source_' + avatarFile, source.url); } catch { /* storage unavailable */ }
+            const urls = [...new Set(remote.images)];
+            if (!urls.length) { toastr.info('No site gallery images found for this card. Use Import Embedded Images for links in creator notes or the description.'); return; }
+            const { imported } = await importImageUrls(urls, folder, button);
+            if (imported) refreshImportedGallery(avatarFile);
         } catch (error) {
             console.error('[WaifuAvatar] Gallery import failed:', error);
-            toastr.error(`Failed to import Chub gallery: ${error.message || error}`);
+            toastr.error('Gallery import failed: ' + (error.message || error));
         } finally {
             isDownloading = false;
-            if (button instanceof HTMLElement) {
-                button.classList.remove('disabled');
-                button.setAttribute('title', 'Import Chub Gallery');
-            }
+            button?.classList.remove('disabled');
+            if (button) button.title = 'Import Chub or BotBooru gallery';
         }
+    }
+
+    async function collectChubGallery(source) {
+        let node;
+        try {
+            node = await fetchChubCharacterNode(source.path);
+        } catch (error) {
+            console.warn('[WaifuAvatar] Chub character unavailable:', error);
+            toastr.warning('Chub could not be reached; checking images and linked albums stored in this card.');
+            return { images: [] };
+        }
+        const { normalizeUrl } = await getGalleryTools();
+        let images = [];
+        try {
+            if (!node.id) throw new Error('Chub card id was not found');
+            const nodes = await fetchAllGalleryNodes(node.id);
+            images = nodes.map(item => normalizeUrl(item?.primary_image_path, 'https://chub.ai')).filter(Boolean);
+        } catch (error) {
+            console.warn('[WaifuAvatar] Chub gallery unavailable:', error);
+            toastr.warning('Chub gallery could not be read. Use Import Embedded Images to scan creator notes and linked albums.');
+        }
+        return { images };
+    }
+
+    function refreshImportedGallery(avatarFile) {
+        if (carouselState.avatarFile === avatarFile) {
+            carouselState.loaded = false;
+            ensureCarouselSources(avatarFile);
+        }
+    }
+
+    async function requestBotbooruToken() {
+        return new Promise(resolve => {
+            const dialog = document.createElement('dialog');
+            dialog.className = 'wacg-auth-dialog';
+            dialog.innerHTML = `<form method="dialog">
+                <h3>Connect BotBooru</h3>
+                <p>BotBooru requires a login to read this card. Your Chrome login is separate from SillyTavern.</p>
+                <p>On botbooru.com while logged in, open Developer Tools → Application → Local Storage → https://botbooru.com. Copy the value named <b>token</b> into this field.</p>
+                <label>BotBooru session token <input class="text_pole" type="password" name="token" autocomplete="off" required></label>
+                <p>The token stays in memory until this page is reloaded. It is sent only to BotBooru through your SillyTavern server.</p>
+                <button class="menu_button" value="connect">Connect</button>
+                <button class="menu_button" value="cancel" formnovalidate>Cancel</button>
+            </form>`;
+            dialog.addEventListener('close', () => {
+                const value = dialog.returnValue === 'connect' ? dialog.querySelector('input').value.trim() : '';
+                dialog.remove();
+                resolve(value);
+            }, { once: true });
+            document.body.appendChild(dialog);
+            dialog.showModal();
+        });
+    }
+
+    async function collectBotbooruGallery(source) {
+        const { fetchRemote, normalizeUrl } = await getGalleryTools();
+        const endpoint = 'https://botbooru.com/post/' + source.id;
+        const readPost = async () => {
+            const headers = botbooruToken ? { Authorization: 'Bearer ' + botbooruToken } : {};
+            const response = await fetchRemote(endpoint, headers);
+            return { response, post: await response.json() };
+        };
+        let result = await readPost();
+        if (result.post?.detail === 'login_required' || [401, 403].includes(result.response.status)) {
+            botbooruToken = await requestBotbooruToken();
+            if (!botbooruToken) return null;
+            result = await readPost();
+        }
+        if (!result.response.ok) {
+            if ([401, 403].includes(result.response.status) || result.post?.detail === 'login_required') botbooruToken = '';
+            throw new Error('BotBooru: ' + (result.post?.detail || result.response.status));
+        }
+        const post = result.post;
+        const gallery = Array.isArray(post.mini_gallery?.images) ? post.mini_gallery.images : [];
+        return {
+            images: gallery.map(image => normalizeUrl(image.url || image.main_view_url, endpoint)).filter(Boolean),
+        };
     }
 
     async function importEmbeddedImagesFromCurrentCharacter() {
@@ -774,37 +828,25 @@
         }
 
         try {
-            toastr.info('Scanning description, greetings, and lorebook...');
-            const embeddedUrls = getEmbeddedImageUrlsForCurrentCharacter();
-            const lorebookUrls = await getCharacterLorebookImageUrls();
-
-            const allUrls = [...new Set([...embeddedUrls, ...lorebookUrls])];
+            const avatarFile = getCurrentCharacterData()?.avatar;
+            toastr.info('Scanning creator notes, description, greetings, and lorebook...');
+            const [embeddedUrls, lorebookUrls] = await Promise.all([
+                getEmbeddedImageUrlsForCurrentCharacter(), getCharacterLorebookImageUrls(),
+            ]);
+            const { resolveImageLinks } = await getGalleryTools();
+            const { images: allUrls, failures } = await resolveImageLinks([...embeddedUrls, ...lorebookUrls]);
+            if (failures.length) {
+                console.warn('[WaifuAvatar] Unresolved gallery links:', failures);
+                toastr.warning(`${failures.length} linked page(s) could not be read. ${failures[0]}`);
+            }
 
             if (!allUrls.length) {
-                toastr.info('No embedded images found in description, greetings, or lorebook.');
+                toastr.info('No images found in creator notes, description, greetings, or lorebook.');
                 return;
             }
 
-            toastr.info(`Importing ${allUrls.length} embedded image(s) into SillyTavern gallery...`);
-            let importedCount = 0;
-            for (let i = 0; i < allUrls.length; i++) {
-                try {
-                    await uploadImageToStGallery(
-                        allUrls[i],
-                        galleryFolder,
-                        { filename: `embedded-${String(i + 1).padStart(3, '0')}.png` },
-                    );
-                    importedCount++;
-                } catch (error) {
-                    console.warn('[WaifuAvatar] Skipped embedded image import:', error);
-                }
-            }
-
-            if (importedCount === 0) {
-                toastr.warning('No embedded images could be imported.');
-            } else {
-                toastr.success(`Imported ${importedCount} embedded image(s) into "${galleryFolder}".`);
-            }
+            const { imported } = await importImageUrls(allUrls, galleryFolder, button);
+            if (imported) refreshImportedGallery(avatarFile);
         } catch (error) {
             console.error('[WaifuAvatar] Embedded image import failed:', error);
             toastr.error(`Failed to import embedded images: ${error.message || error}`);
@@ -812,7 +854,7 @@
             isDownloading = false;
             if (button instanceof HTMLElement) {
                 button.classList.remove('disabled');
-                button.setAttribute('title', 'Import embedded images from description and greetings');
+                button.setAttribute('title', 'Import images and linked albums from creator notes, description, greetings, and lorebook');
             }
         }
     }
@@ -828,8 +870,8 @@
             button = document.createElement('div');
             button.id = BUTTON_ID;
             button.className = 'menu_button menu_button_icon';
-            button.innerHTML = '<i class="fa-solid fa-images"></i><span>Import Chub Gallery</span>';
-            button.setAttribute('title', 'Import Chub Gallery');
+            button.innerHTML = '<i class="fa-solid fa-images"></i><span>Import Gallery</span>';
+            button.setAttribute('title', 'Import Chub or BotBooru gallery');
             titleRow.appendChild(button);
         }
 
@@ -844,7 +886,7 @@
             embeddedButton.id = EMBEDDED_BUTTON_ID;
             embeddedButton.className = 'menu_button menu_button_icon';
             embeddedButton.innerHTML = '<i class="fa-solid fa-file-image"></i><span>Import Embedded Images</span>';
-            embeddedButton.setAttribute('title', 'Import embedded images from description and greetings');
+            embeddedButton.setAttribute('title', 'Import images and linked albums from creator notes, description, greetings, and lorebook');
             titleRow.appendChild(embeddedButton);
         }
 
@@ -853,9 +895,10 @@
             embeddedButton.dataset.bound = 'true';
         }
 
-        const chubPath = getCurrentCharacterChubPath();
-        button.style.display = chubPath ? '' : 'none';
-        embeddedButton.style.display = getCurrentCharacterData() ? '' : 'none';
+        const hasCharacter = Boolean(getCurrentCharacterData());
+        button.style.display = hasCharacter ? '' : 'none';
+        embeddedButton.style.display = hasCharacter ? '' : 'none';
+        document.getElementById('wacg-import-botbooru-btn')?.remove();
     }
 
     const syncAllDebounced = debounce(() => {
